@@ -174,6 +174,33 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val languageResult = tts.setLanguage(Locale.KOREAN)
         ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
             languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                addLog("TTS onStart id=$utteranceId")
+            }
+
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread {
+                    if (utteranceId == currentUtteranceId && playing) {
+                        addLog("TTS onDone id=$utteranceId")
+                        currentIndex++
+                        speakCurrentSentence()
+                    }
+                }
+            }
+
+            @Deprecated("Deprecated in Android")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread {
+                    addLog("TTS onError id=$utteranceId")
+                    if (utteranceId == currentUtteranceId) {
+                        playing = false
+                        currentUtteranceId = null
+                        updatePlaybackState()
+                    }
+                }
+            }
+        })
         addLog("TTS initialized ready=$ttsReady languageResult=$languageResult engine=${tts.defaultEngine}")
         updateScreen()
     }
