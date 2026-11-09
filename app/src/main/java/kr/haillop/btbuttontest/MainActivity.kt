@@ -5,15 +5,16 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.ViewGroup
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.media.session.MediaButtonReceiver
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
@@ -24,13 +25,20 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var session: MediaSessionCompat
     private lateinit var logView: TextView
     private lateinit var stateView: TextView
+    private lateinit var tts: TextToSpeech
     private val logs = mutableListOf<String>()
-    private var sessionEnabled = false
-    private var playing = true
+    private val sentences = listOf("안녕하세요.", "좋은 하루 되세요.", "행복하세요.")
+    private var currentIndex = 0
+    private var sessionEnabled = true
+    private var playing = false
+    private var ttsReady = false
+    private var utteranceSerial = 0
+    private var currentUtteranceId: String? = null
+    private var destroyed = false
 
     private val logFile: File by lazy { File(filesDir, "diagnostic_logs.json") }
 
@@ -38,8 +46,9 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         loadLogs()
         buildScreen()
-        addLog("APP onCreate savedInstanceState=${savedInstanceState != null}")
+        addLog("APP onCreate")
         initializeSession()
+        tts = TextToSpeech(this, this)
         updateScreen()
     }
 
@@ -59,17 +68,13 @@ class MainActivity : Activity() {
         }
         root.addView(title, LinearLayout.LayoutParams(-1, -2))
         root.addView(stateView, LinearLayout.LayoutParams(-1, -2))
-
-        addButton(root, "세션 활성화 / 비활성화") {
+        addButton(root, "테스트 문장 재생") { startSpeech() }
+        addButton(root, "재생 / 일시정지") { toggleSpeech() }
+        addButton(root, "정지") { stopSpeech() }
+        addButton(root, "미디어 세션 활성화 / 비활성화") {
             sessionEnabled = !sessionEnabled
             session.isActive = sessionEnabled
             addLog("UI sessionActive=$sessionEnabled")
-            updatePlaybackState()
-            updateScreen()
-        }
-        addButton(root, "재생 상태 전환 (PLAYING / PAUSED)") {
-            playing = !playing
-            addLog("UI playing=$playing")
             updatePlaybackState()
             updateScreen()
         }
@@ -110,42 +115,38 @@ class MainActivity : Activity() {
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onMediaButtonEvent(mediaButtonEvent: android.content.Intent): Boolean {
                     @Suppress("DEPRECATION")
-                    val event = mediaButtonEvent.getParcelableExtra(IntentKeyEvent) as? KeyEvent
+                    val event = mediaButtonEvent.getParcelableExtra("android.intent.extra.KEY_EVENT") as? KeyEvent
                     addLog("CALLBACK onMediaButtonEvent action=${event?.action} keyCode=${event?.keyCode} repeat=${event?.repeatCount} device=${event?.deviceId}")
                     return super.onMediaButtonEvent(mediaButtonEvent)
                 }
 
                 override fun onPlay() {
                     addLog("CALLBACK onPlay")
-                    playing = true
-                    updatePlaybackState()
-                    updateScreen()
+                    resumeSpeech()
                 }
 
                 override fun onPause() {
                     addLog("CALLBACK onPause")
-                    playing = false
-                    updatePlaybackState()
-                    updateScreen()
+                    pauseSpeech()
                 }
 
                 override fun onStop() {
                     addLog("CALLBACK onStop")
-                    playing = false
-                    updatePlaybackState()
-                    updateScreen()
+                    stopSpeech()
                 }
 
                 override fun onSkipToNext() {
                     addLog("CALLBACK onSkipToNext")
+                    if (currentIndex < sentences.lastIndex) {
+                        currentIndex++
+                        if (playing) speakCurrentSentence()
+                    }
                 }
 
                 override fun onSkipToPrevious() {
                     addLog("CALLBACK onSkipToPrevious")
-                }
-
-                override fun onSeekTo(pos: Long) {
-                    addLog("CALLBACK onSeekTo position=$pos")
+                    currentIndex = (currentIndex - 1).coerceAtLeast(0)
+                    if (playing) speakCurrentSentence()
                 }
             })
             setFlags(
@@ -154,8 +155,8 @@ class MainActivity : Activity() {
             )
             setMetadata(
                 MediaMetadataCompat.Builder()
-                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "Bluetooth input test")
-                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "BTButtonTest")
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "안녕하세요. 좋은 하루 되세요. 행복하세요.")
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "BTButtonTest TTS")
                     .build()
             )
             isActive = true
@@ -163,6 +164,96 @@ class MainActivity : Activity() {
         sessionEnabled = true
         addLog("SESSION initialized active=${session.isActive}")
         updatePlaybackState()
+    }
+
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) {
+            addLog("TTS initFailed status=$status")
+            return
+        }
+        val languageResult = tts.setLanguage(Locale.KOREAN)
+        ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
+            languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+        addLog("TTS initialized ready=$ttsReady languageResult=$languageResult engine=${tts.defaultEngine}")
+        updateScreen()
+    }
+
+    private fun startSpeech() {
+        if (!ttsReady) {
+            addLog("TTS startRejected notReady")
+            Toast.makeText(this, "TTS 준비 중이거나 한국어 음성이 없어.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        currentIndex = 0
+        playing = true
+        addLog("TTS start")
+        updatePlaybackState()
+        speakCurrentSentence()
+    }
+
+    private fun toggleSpeech() {
+        if (playing) pauseSpeech() else resumeSpeech()
+    }
+
+    private fun resumeSpeech() {
+        if (!ttsReady) {
+            addLog("TTS resumeRejected notReady")
+            return
+        }
+        if (playing) {
+            addLog("TTS resumeIgnored alreadyPlaying")
+            return
+        }
+        if (currentIndex >= sentences.size) currentIndex = 0
+        playing = true
+        addLog("TTS resume sentenceIndex=$currentIndex")
+        updatePlaybackState()
+        speakCurrentSentence()
+    }
+
+    private fun pauseSpeech() {
+        if (!playing) {
+            addLog("TTS pauseIgnored alreadyPaused")
+            return
+        }
+        playing = false
+        tts.stop()
+        currentUtteranceId = null
+        addLog("TTS paused sentenceIndex=$currentIndex (resume restarts current sentence)")
+        updatePlaybackState()
+        updateScreen()
+    }
+
+    private fun stopSpeech() {
+        tts.stop()
+        playing = false
+        currentIndex = 0
+        currentUtteranceId = null
+        addLog("TTS stopped")
+        updatePlaybackState()
+        updateScreen()
+    }
+
+    private fun speakCurrentSentence() {
+        if (!playing || !ttsReady) return
+        if (currentIndex >= sentences.size) {
+            playing = false
+            currentUtteranceId = null
+            addLog("TTS completed")
+            updatePlaybackState()
+            updateScreen()
+            return
+        }
+        val id = "sentence-${currentIndex}-${++utteranceSerial}"
+        currentUtteranceId = id
+        addLog("TTS speak index=$currentIndex text=${sentences[currentIndex]} id=$id")
+        val result = tts.speak(sentences[currentIndex], TextToSpeech.QUEUE_FLUSH, null, id)
+        if (result == TextToSpeech.ERROR) {
+            playing = false
+            addLog("TTS speakError index=$currentIndex")
+            updatePlaybackState()
+        }
+        updateScreen()
     }
 
     private fun updatePlaybackState() {
@@ -173,16 +264,15 @@ class MainActivity : Activity() {
             PlaybackStateCompat.ACTION_PLAY_PAUSE or
             PlaybackStateCompat.ACTION_STOP or
             PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-            PlaybackStateCompat.ACTION_SEEK_TO
+            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
         session.setPlaybackState(
             PlaybackStateCompat.Builder()
                 .setActions(actions)
-                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
-                .setActiveQueueItemId(0)
+                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, if (playing) 1.0f else 0.0f)
                 .build()
         )
         addLog("SESSION playbackState=${if (playing) "PLAYING" else "PAUSED"} active=${session.isActive}")
+        updateScreen()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -211,11 +301,13 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         addLog("APP onDestroy")
         if (::session.isInitialized) {
             session.isActive = false
             session.release()
         }
+        if (::tts.isInitialized) tts.shutdown()
         super.onDestroy()
     }
 
@@ -264,11 +356,7 @@ class MainActivity : Activity() {
 
     private fun updateScreen() {
         if (!::stateView.isInitialized) return
-        stateView.text = "MediaSession: ${if (sessionEnabled) "ACTIVE" else "INACTIVE"}\nPlaybackState: ${if (playing) "PLAYING" else "PAUSED"}\n로그 파일: files/diagnostic_logs.json"
+        stateView.text = "TTS: ${if (ttsReady) "READY" else "INITIALIZING"}\nMediaSession: ${if (sessionEnabled) "ACTIVE" else "INACTIVE"}\nPlaybackState: ${if (playing) "PLAYING" else "PAUSED"}\n문장: ${currentIndex + 1}/${sentences.size}\n로그 파일: files/diagnostic_logs.json"
         if (::logView.isInitialized) logView.text = logs.joinToString("\n")
-    }
-
-    companion object {
-        private const val IntentKeyEvent = "android.intent.extra.KEY_EVENT"
     }
 }
